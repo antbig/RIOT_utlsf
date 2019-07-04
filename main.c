@@ -12,18 +12,84 @@
 #include <string.h>
 #include <inttypes.h>
 
-typedef void* utlsf_ptr_t;
-typedef uint32_t utlsf_size_t;
 
-static inline void* utlsf_zptrd(utlsf_ptr_t ptr)
+#ifndef UTLSF_COMPRESS_FREE_LIST_PTR
+#define	UTLSF_COMPRESS_FREE_LIST_PTR 	(1)
+#endif
+
+#ifndef UTLSF_COMPRESS_HEADER_PTR
+#define	UTLSF_COMPRESS_HEADER_PTR 	(0)
+#endif
+
+
+#if UTLSF_COMPRESS_FREE_LIST_PTR
+/* Type of the free list pointer.
+* This is used to compress the pointer*/
+typedef uint16_t utlsf_free_list_ptr_t;
+
+static uint32_t utlsf_free_list_ptr_base;
+
+static inline void* utlsf_free_list_zptrd(utlsf_free_list_ptr_t ptr)
+{
+    return (void *)((uint32_t)&utlsf_free_list_ptr_base + ((uint32_t)ptr << 2));;
+}
+
+static inline utlsf_free_list_ptr_t utlsf_free_list_zptre(void* ptr)
+{
+    return (uint16_t)(((uint32_t)ptr - (uint32_t)&utlsf_free_list_ptr_base) >> 2);
+}
+
+#else
+
+/* Type of the free list pointer.
+* This is used to compress the pointer*/
+typedef void* utlsf_free_list_ptr_t;
+
+static inline void* utlsf_free_list_zptrd(utlsf_free_list_ptr_t ptr)
 {
     return ptr;
 }
 
-static inline utlsf_ptr_t utlsf_zptre(void* ptr)
+static inline utlsf_free_list_ptr_t utlsf_free_list_zptre(void* ptr)
 {
     return ptr;
 }
+
+#endif
+
+#if UTLSF_COMPRESS_HEADER_PTR
+
+typedef uint16_t utlsf_header_ptr_t;
+typedef uint16_t utlsf_size_t;
+
+static uint32_t utlsf_header_ptr_base;
+
+static inline void* utlsf_header_zptrd(utlsf_header_ptr_t ptr)
+{
+    return ptr;
+}
+
+static inline utlsf_header_ptr_t utlsf_header_zptre(void* ptr)
+{
+    return ptr;
+}
+
+#else 
+
+typedef void* utlsf_header_ptr_t;
+typedef uint32_t utlsf_header_size_t;
+
+static inline void* utlsf_header_zptrd(utlsf_header_ptr_t ptr)
+{
+    return ptr;
+}
+
+static inline utlsf_header_ptr_t utlsf_header_zptre(void* ptr)
+{
+    return ptr;
+}
+
+#endif
 
 enum utlsf_private
 {
@@ -55,30 +121,38 @@ enum utlsf_private
 #define BLOCK_NULL &utlsf->block_null
 
 typedef struct {
-    utlsf_ptr_t prev_phys_block;
-    utlsf_size_t size;
-    utlsf_ptr_t next_free;
-    utlsf_ptr_t prev_free;
+    utlsf_header_ptr_t prev_phys_block;
+    utlsf_header_size_t size;
+    utlsf_header_ptr_t next_free;
+    utlsf_header_ptr_t prev_free;
 } utlsf_block_hdr_t;
 
 typedef struct {
     /* maximum allocation size for this utlsf instance */
-    utlsf_size_t max_alloc_size_log2;
+    utlsf_header_size_t max_alloc_size_log2;
 
     /* Empty lists point at this block to indicate they are free. */
     utlsf_block_hdr_t block_null;
 
     /* Bitmaps for free lists. */
     unsigned int fl_bitmap;
-    uint8_t *sl_bitmap;
+    unsigned int sl_bitmap[14];
+
+    char alignement[2];//TODO find a way to remove this
 
     /* Head of free lists. */
-    utlsf_ptr_t data[];
+    utlsf_free_list_ptr_t free_list[56];
+    
 } utlsf_t;
 
 static inline utlsf_block_hdr_t *get_free_list_head(utlsf_t *utlsf, unsigned fl, unsigned sl)
 {
-    return (utlsf_block_hdr_t *)utlsf_zptrd((utlsf_ptr_t *)((uintptr_t)utlsf->data + (((fl * SL_INDEX_COUNT) + sl) * sizeof(utlsf_ptr_t))));
+    return (utlsf_block_hdr_t *)utlsf_free_list_zptrd(utlsf->free_list[(fl * SL_INDEX_COUNT) + sl]);
+}
+
+static inline void set_free_list_head(utlsf_t *utlsf, unsigned fl, unsigned sl, utlsf_block_hdr_t *block)
+{
+    utlsf->free_list[(fl * SL_INDEX_COUNT) + sl] = utlsf_free_list_zptre(block);
 }
 
 static inline int fls(unsigned int word)
@@ -113,11 +187,11 @@ static const size_t block_header_prev_free_bit = 1 << 1;
  * The size of the block header exposed to used blocks is the size field.
  * The prev_phys_block field is stored *inside* the previous free block.
 */
-static const size_t block_header_overhead = sizeof(utlsf_size_t);
+static const size_t block_header_overhead = sizeof(utlsf_header_size_t);
 
 /* User data starts directly after the size field in a used block. */
 static const size_t block_start_offset =
-    offsetof(utlsf_block_hdr_t, size) + sizeof(utlsf_size_t);
+    offsetof(utlsf_block_hdr_t, size) + sizeof(utlsf_header_size_t);
 
 /*
  * A free block must be large enough to store its header minus the size of
@@ -125,7 +199,7 @@ static const size_t block_start_offset =
  * bits for FL_INDEX.
 */
 static const size_t block_size_min =
-    sizeof(utlsf_block_hdr_t) - sizeof(utlsf_ptr_t);
+    sizeof(utlsf_block_hdr_t) - sizeof(utlsf_header_ptr_t);
 static const size_t block_size_max = utlsf_cast(size_t, 1) << FL_INDEX_MAX;
 
 /*
@@ -140,7 +214,7 @@ static size_t block_size(const utlsf_block_hdr_t *block)
 static void block_set_size(utlsf_block_hdr_t *block, size_t size)
 {
     const size_t oldsize = block->size;
-    printf("setting block: %p size %d\n", (void *)block, size);
+    //printf("setting block: %p size %d\n", (void *)block, size);
     block->size = size | (oldsize & (block_header_free_bit | block_header_prev_free_bit));
 }
 
@@ -345,9 +419,7 @@ static utlsf_block_hdr_t* search_suitable_block(utlsf_t *pool, int* fli, int* sl
             return 0;
         }
 
-        printf("before utlsf_ffs : %d\n", fl);
         fl = utlsf_ffs(fl_map);
-        printf("after utlsf_ffs : %d\n", fl);
         *fli = fl;
         sl_map = pool->sl_bitmap[fl];
     }
@@ -355,8 +427,8 @@ static utlsf_block_hdr_t* search_suitable_block(utlsf_t *pool, int* fli, int* sl
     sl = utlsf_ffs(sl_map);
     *sli = sl;
 
-    printf("search_suitable_block found fl: %d sl: %d\n", fl, sl);
-    printf("sl_bitmap 0x%x\n", (unsigned)sl_map);
+    //printf("search_suitable_block found fl: %d sl: %d\n", fl, sl);
+    //printf("sl_bitmap 0x%x\n", (unsigned)sl_map);
 
     /* Return the first block in the free list. */
     return get_free_list_head(pool, fl, sl);
@@ -378,10 +450,9 @@ static void remove_free_block(utlsf_t *utlsf, utlsf_block_hdr_t *block, int fl, 
         prev->next_free = next;
     }
 
-    
     /* If this block is the head of the free list, set new head. */
     if (list_head == block) {
-        list_head = next;
+        set_free_list_head(utlsf, fl, sl, next);
 
         /* If the new head is null, clear the bitmap. */
         if (next == BLOCK_NULL) {
@@ -401,7 +472,7 @@ static void insert_free_block(utlsf_t *utlsf, utlsf_block_hdr_t *block, int fl, 
     utlsf_block_hdr_t *list_head = get_free_list_head(utlsf, fl, sl);
     utlsf_block_hdr_t *current = list_head;
 
-    printf("current=%p %p\n", (void *)current, (void *)list_head);
+    //printf("current=%p %p\n", (void *)current, (void *)list_head);
     assert(current && "free list cannot have a null entry");
     assert(block && "cannot insert a null entry into the free list");
     block->next_free = current;
@@ -414,7 +485,7 @@ static void insert_free_block(utlsf_t *utlsf, utlsf_block_hdr_t *block, int fl, 
     ** Insert the new block at the head of the list, and mark the first-
     ** and second-level bitmaps appropriately.
     */
-    list_head = block;
+    set_free_list_head(utlsf, fl, sl, block);
     utlsf->fl_bitmap |= (1 << fl);
     utlsf->sl_bitmap[fl] |= (1 << sl);
 }
@@ -434,8 +505,8 @@ static void block_insert(utlsf_t *utlsf, utlsf_block_hdr_t *block)
     int fl, sl;
 
     mapping_insert(block_size(block), &fl, &sl);
-    printf("mapping_insert fl: %d sl: %d\n", fl, sl);
-    printf("block_insert() fl=%i sl=%i\n", fl, sl);
+    //printf("mapping_insert fl: %d sl: %d\n", fl, sl);
+    //printf("block_insert() fl=%i sl=%i\n", fl, sl);
     insert_free_block(utlsf, block, fl, sl);
 }
 
@@ -485,6 +556,7 @@ static utlsf_block_hdr_t *block_merge_prev(utlsf_t *utlsf, utlsf_block_hdr_t *bl
         assert(block_is_free(prev) && "prev block is not free though marked as such");
         block_remove(utlsf, prev);
         block = block_absorb(prev, block);
+        //printf("merging prev block %p\n", (void *)block);
     }
 
     return block;
@@ -513,7 +585,7 @@ static void block_trim_free(utlsf_t *utlsf, utlsf_block_hdr_t *block, size_t siz
     if (block_can_split(block, size)) {
         utlsf_block_hdr_t *remaining_block = block_split(block, size);
         block_link_next(block);
-        block_set_prev_free(remaining_block);
+        block_set_prev_used(remaining_block);
         block_insert(utlsf, remaining_block);
     }
 }
@@ -555,7 +627,7 @@ static utlsf_block_hdr_t *block_locate_free(utlsf_t *utlsf, size_t size)
 
     if (size) {
         mapping_search(size, &fl, &sl);
-        printf("block_locate_free() fl=%i sl=%i\n", fl, sl);
+        //printf("block_locate_free() fl=%i sl=%i\n", fl, sl);
         block = search_suitable_block(utlsf, &fl, &sl);
     }
 
@@ -575,6 +647,7 @@ static void *block_prepare_used(utlsf_t *utlsf, utlsf_block_hdr_t *block, size_t
         block_trim_free(utlsf, block, size);
         block_mark_as_used(block);
         p = block_to_ptr(block);
+        memset(p, 0, size);
     }
     return p;
 }
@@ -582,9 +655,9 @@ static void *block_prepare_used(utlsf_t *utlsf, utlsf_block_hdr_t *block, size_t
 void *utlsf_malloc(utlsf_t *utlsf, size_t size)
 {
     const size_t adjust = adjust_request_size(size, ALIGN_SIZE);
-    printf("utlsf_malloc() adjust=%u\n", adjust);
+    //printf("utlsf_malloc() adjust=%u\n", adjust);
     utlsf_block_hdr_t* block = block_locate_free(utlsf, adjust);
-    printf("utlsf_malloc block located: %p => %x\n", (void *)block, (unsigned int)&block);
+    //printf("utlsf_malloc block located: %p => %x\n", (void *)block, (unsigned int)&block);
     return block_prepare_used(utlsf, block, adjust);
 }
 
@@ -607,18 +680,17 @@ static unsigned _utlsf_fl_index_count(unsigned max_alloc_size_log2)
     return max_alloc_size_log2 - FL_INDEX_SHIFT + 1;
 }
 
-size_t utlsf_create(void *buf, utlsf_size_t max_alloc_size)
+size_t utlsf_create(void *buf, utlsf_header_size_t max_alloc_size)
 {
     unsigned max_alloc_size_log2 = fls(max_alloc_size) + 1;
     unsigned fl_index_count = _utlsf_fl_index_count(max_alloc_size_log2);
-    printf("max_alloc_size_log2=%u fl_index_count=%u\n", max_alloc_size_log2, fl_index_count);
+    //printf("max_alloc_size_log2=%u fl_index_count=%u\n", max_alloc_size_log2, fl_index_count);
     unsigned free_list_count = (fl_index_count * SL_INDEX_COUNT) + 1;
     unsigned free_list_size = free_list_count * sizeof(uintptr_t);
     unsigned sl_bitmap_size = fl_index_count;
     unsigned total_size = sizeof(utlsf_t) + free_list_size + sl_bitmap_size;
 
     if (buf) {
-        
         /* make sure heap is aligned to 8 bytes */
         assert (!((uintptr_t)buf & (sizeof(void *) - 1)));
 
@@ -626,13 +698,12 @@ size_t utlsf_create(void *buf, utlsf_size_t max_alloc_size)
         memset(utlsf, '\0', total_size);
 
         utlsf->max_alloc_size_log2 = max_alloc_size_log2;
-        printf("free_list_count: %d\n",free_list_count);
+        //printf("free_list_count: %d\n",free_list_count);
         for (unsigned i = 0; i < free_list_count; i++) {
-            utlsf_block_hdr_t **next = (utlsf_block_hdr_t**)((uintptr_t)utlsf->data + (i * sizeof(utlsf_ptr_t)));
-            *next = &utlsf->block_null;
+            utlsf->free_list[i] = utlsf_free_list_zptre(&utlsf->block_null);
         }
 
-        utlsf->sl_bitmap = (void *)((uintptr_t)buf + sizeof(utlsf_t) + free_list_size);
+        //utlsf->sl_bitmap = (void *)((uintptr_t)buf + sizeof(utlsf_t) + free_list_size);
 
     }
 
@@ -720,14 +791,12 @@ void utlsf_walk_pool(void* pool, utlsf_walker_t walker, void *user)
 void utlsf_walk_free(utlsf_t *utlsf)
 {
     unsigned fl_index_count = _utlsf_fl_index_count(utlsf->max_alloc_size_log2);
-    printf("block_null is %p\n", (void *)&utlsf->block_null);
     for (unsigned int i = 0; i < fl_index_count; ++i) {
-        printf("Free block at fl:%d\n", i);
         for (int j = 0; j < SL_INDEX_COUNT; ++j) {
             utlsf_block_hdr_t *_list_head = get_free_list_head(utlsf, i, j);
             utlsf_block_hdr_t *next = _list_head;
             while (next != &utlsf->block_null) {
-                printf("free block at: %p size: %u next: %p\n", (void *)next, block_size(next), (void *)next->next_free);
+                printf("free block at: %p size: %u prev: %p next: %p prev_phys: %p\n", (void *)next, block_size(next), (void *)next->prev_free, (void *)next->next_free, (void *)next->prev_phys_block);
                 next = next->next_free;
             }
         }
@@ -785,13 +854,20 @@ void hexDump(void *addr, int len)
     printf("  %s\n", buff);
 }
 
-#define TLSF_POOL_SIZE 102400
+//134752756
+#define TLSF_POOL_SIZE 102400 
 #define TLSF_BUFFER     (TLSF_POOL_SIZE / sizeof(uint32_t))
 
 static uint32_t heap[TLSF_BUFFER];
 
 utlsf_t utlsf;
 
+#define EMPTY_SPACE_ZIZE 1000
+
+static char empty_space[EMPTY_SPACE_ZIZE];
+
+#define malloc(x) utlsf_malloc(&utlsf, x)
+/*
 int main(void)
 {
     printf("sizeof(utlsf) == %u\n", sizeof(utlsf));
@@ -815,16 +891,96 @@ int main(void)
     void *found = utlsf_malloc(&utlsf, 128);
     printf("got: %p\n", found);
 
-    void *found2 = utlsf_malloc(&utlsf, 257);
+    void *found2 = utlsf_malloc(&utlsf, 128);
     printf("got2: %p\n", found2);
 
-    void *found3 = utlsf_malloc(&utlsf, 60000);
+    
+
+    void *found3 = utlsf_malloc(&utlsf, 128);
     printf("got3: %p\n", found3);
 
     utlsf_free(&utlsf, found);
+
+    utlsf_free(&utlsf, found2);
+
+    utlsf_free(&utlsf, found3);
     puts("freed 0");
 
+    utlsf_walk_free(&utlsf);
+
     while(1) {}
+    return 0;
+}*/
+
+typedef struct node {
+    struct node *next;
+} t_node;
+
+
+//char buf[1024];
+int total = 0;
+int allocation = 0;
+
+void *fill_memory(void *head, int chunk_size)
+{
+    if(head == NULL) {
+        head = malloc(chunk_size);
+        if(head) {
+            total += chunk_size;
+            allocation++;
+        }
+    }
+    void *new_head = head;
+    while(new_head) {
+        new_head = malloc(chunk_size);
+        if(new_head) {
+            ((t_node *)head)->next = new_head;
+            head = new_head;
+            total += chunk_size;
+            allocation++;
+        }
+    }
+    return head;
+}
+
+int main(void)
+{
+    total = 0;
+    allocation = 0;
+
+    printf("SIZE UTLSF %d %p\n", sizeof(utlsf_t), (void *)&utlsf);
+
+    utlsf_create(&utlsf, (1<<17)-1);
+    utlsf_add_pool(&utlsf, heap, sizeof(heap));
+    int chunk_sizes[] = {1024, 512, 256, 128, 64, 32, 16, 8};//We will run this test for different size of chunk
+
+    void *head = NULL;
+    int old_total = 0;
+    int diff = 0;
+
+    printf("%c\n", empty_space[0]);
+    printf("TOTAL %d\n", total);
+    printf("old_total %d\n", old_total);
+
+    for(int i = 0; i < 7; i++) {
+        int chunk_size = chunk_sizes[i];
+        head = fill_memory(head, chunk_size);
+        diff = total - old_total;
+        printf("TEST_FLAG %d  %d  %d\n", chunk_size, total, diff);
+        old_total = total;
+    }
+    printf("Total allocated size is %d %d\n", total, allocation);
+    total = 0;
+    old_total = 0;
+
+    for(total = 0; total < EMPTY_SPACE_ZIZE; total++) {
+        if(empty_space[total] != 0) {
+            printf("utlsf is overwriting memory at %d\n", total);
+        }
+    }
+    while (1) {
+    }
+
     return 0;
 }
 
