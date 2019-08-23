@@ -2,7 +2,7 @@ APPLICATION=tlsf2
 
 BOARD ?= native
 
-RIOTBASE ?= $(CURDIR)/../RIOT
+RIOTBASE ?= $(CURDIR)/RIOT
 
 # Add required modules here
 USEMODULE += shell
@@ -12,5 +12,5 @@ USEMODULE += ps
 USEMODULE += xtimer
 
 DEVELHELP ?= 1
-
+CFLAGS += -g
 include $(RIOTBASE)/Makefile.include
